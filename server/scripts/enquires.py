@@ -15,7 +15,6 @@ from typing import List, Dict, Any, Optional, Tuple, Generator
 import logging
 from functools import lru_cache, partial
 import threading
-from itertools import islice
 import gc
 
 # Configure optimized logging
@@ -42,9 +41,12 @@ _db_args, _ = _db_parser.parse_known_args()
 _DB_PREFIX = "NEW_" if _db_args.db == 'new' else ""
 
 # Optimized Configuration
-BATCH_SIZE = 5000  # Increased batch size for faster processing
 MAX_WORKERS = min(32, (os.cpu_count() or 1) * 4)  # More workers for parallel processing
 CHUNK_SIZE = 500  # Size of chunks for processing
+PAGE_SIZE = 2000  # Documents per paginated Firestore query
+PAGE_TIMEOUT = 120  # Seconds allowed per page request
+PAGE_RETRIES = 4  # Attempts per page before giving up
+RETRY_BACKOFF_BASE = 2  # Seconds, doubled per retry
 SHEETS_BATCH_SIZE = 50000  # Maximum batch size for Sheets API
 
 # Connection pooling
@@ -224,70 +226,81 @@ def get_sheets_service():
         
         return _sheets_service
 
+def _fetch_page(collection_ref, cursor, page_size: int):
+    """Fetch a single page ordered by document id, starting after cursor.
+
+    Each page is a short-lived query, which keeps every request well inside
+    Firestore's scan-time budget instead of one long stream that gets killed
+    with 503 "Query timed out".
+    """
+    query = collection_ref.order_by("__name__").limit(page_size)
+    if cursor is not None:
+        query = query.start_after({"__name__": cursor})
+
+    last_error = None
+    for attempt in range(PAGE_RETRIES):
+        try:
+            return list(query.stream(timeout=PAGE_TIMEOUT))
+        except Exception as error:
+            last_error = error
+            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+            logger.warning(
+                f"Page fetch failed (attempt {attempt + 1}/{PAGE_RETRIES}): {error} "
+                f"- retrying in {wait}s"
+            )
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"Failed to fetch page after {PAGE_RETRIES} attempts"
+    ) from last_error
+
 def parallel_fetch_documents(collection_name: str) -> List[Tuple[str, Dict]]:
-    """Fetch all documents efficiently using streaming and batching"""
+    """Fetch all documents using keyset pagination on document id"""
     db = initialize_firebase()
     collection_ref = db.collection(collection_name)
-    
-    logger.info(f"🚀 Starting optimized fetch from: {collection_name}")
-    
+
+    logger.info(f"🚀 Starting paginated fetch from: {collection_name}")
+
     all_documents = []
     fetch_start = time.time()
-    processed_count = 0
-    
+    cursor = None
+
     try:
-        # Stream documents efficiently
-        doc_stream = collection_ref.stream()
-        
-        # Process in large batches to minimize overhead
         while True:
-            # Fetch a large batch
-            batch = list(islice(doc_stream, BATCH_SIZE))
-            if not batch:
+            page = _fetch_page(collection_ref, cursor, PAGE_SIZE)
+            if not page:
                 break
-            
-            # Convert to tuples immediately (more memory efficient)
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                # Parallel conversion of documents to dictionaries
-                def convert_doc(doc):
-                    return (doc.id, doc.to_dict())
-                
-                # Submit all conversions
-                futures = [executor.submit(convert_doc, doc) for doc in batch]
-                
-                # Collect results
-                for future in as_completed(futures):
-                    try:
-                        all_documents.append(future.result())
-                        processed_count += 1
-                        
-                        # Progress update every 5000 documents
-                        if processed_count % 5000 == 0:
-                            elapsed = time.time() - fetch_start
-                            rate = processed_count / elapsed
-                            logger.info(f"📦 Fetched {processed_count} documents ({rate:.0f} docs/sec)")
-                    except Exception as e:
-                        logger.error(f"Error converting document: {e}")
-            
-            # Free memory from batch
-            del batch
-            
-            # Force garbage collection for large datasets
-            if processed_count % 10000 == 0:
+
+            all_documents.extend((doc.id, doc.to_dict()) for doc in page)
+            cursor = page[-1].id
+
+            elapsed = time.time() - fetch_start
+            rate = len(all_documents) / elapsed if elapsed else 0
+            logger.info(
+                f"📦 Fetched {len(all_documents)} documents ({rate:.0f} docs/sec)"
+            )
+
+            if len(page) < PAGE_SIZE:
+                break
+
+            del page
+            if len(all_documents) % 50000 < PAGE_SIZE:
                 gc.collect()
-    
-    except Exception as e:
-        logger.error(f"Fetch error: {e}")
+
+    except Exception as error:
+        logger.error(f"Fetch error: {error}")
         raise
-    
+
     fetch_duration = time.time() - fetch_start
-    
+
     if all_documents:
         rate = len(all_documents) / fetch_duration
-        logger.info(f"✅ Fetched {len(all_documents)} documents in {fetch_duration:.2f}s ({rate:.0f} docs/sec)")
+        logger.info(
+            f"✅ Fetched {len(all_documents)} documents in {fetch_duration:.2f}s ({rate:.0f} docs/sec)"
+        )
     else:
         logger.warning("No documents found")
-    
+
     return all_documents
 
 def process_documents_parallel(documents: List[Tuple[str, Dict]]) -> List[Dict]:
@@ -552,7 +565,7 @@ def main():
         logger.info("="*60)
         logger.info("⚡ ULTRA-FAST FIRESTORE TO SHEETS SYNC")
         logger.info(f"🔧 Using {MAX_WORKERS} parallel workers")
-        logger.info(f"💾 Batch size: {BATCH_SIZE} | Chunk size: {CHUNK_SIZE}")
+        logger.info(f"💾 Page size: {PAGE_SIZE} | Chunk size: {CHUNK_SIZE}")
         logger.info("="*60)
         
         if not validate_environment():
