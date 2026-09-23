@@ -4,6 +4,7 @@ import math
 import logging
 import time
 import gc
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import islice
 import firebase_admin
@@ -54,7 +55,8 @@ GOOGLE_SHEET_ID           = "1pkGrC3RQRxVwkEcb8AZyhT3KICKadw0IW9udkQsQh5k"
 FETCH_BATCH_SIZE = 5000
 MAX_WORKERS      = min(32, (os.cpu_count() or 1) * 4)
 CHUNK_SIZE       = 500
-WRITE_BATCH_SIZE = 50000
+WRITE_BATCH_SIZE = 2000
+WRITE_WORKERS    = 12
 
 # ---------------------------
 # Firestore Collection Name & Sheet Name
@@ -511,6 +513,35 @@ def build_row_new(item: dict):
 
 
 # ---------------------------
+# Field projection — only the fields build_row / build_row_new actually read.
+# Firestore ships ~5.4 KB/doc without a mask; unused blobs (media_bkp,
+# media_backup, projectImages, ...) are ~40% of that.
+# ---------------------------
+SELECT_FIELDS = [
+    "_geoloc", "added", "ageOfBuilding", "ageOfInventory", "ageOfStatus",
+    "ageOfTheBuilding", "agentName", "agentPhoneNumber", "amenities",
+    "apartmentSubType", "apartmentType", "area", "assetType", "availableFrom",
+    "balconyFacing", "bathroom", "bdaApproved", "bedroom", "biappaApproved",
+    "buildingKhata", "carpet", "carpetArea", "commercialPropertyType",
+    "commercialSubType", "communityType", "cornerUnit", "cpId", "currentStatus",
+    "dataStatus", "dateOfLastChecked", "documents", "driveLink", "eKhata",
+    "exclusive", "extraDetails", "extraRooms", "facing", "features", "floorNo",
+    "floorNumber", "furnishing", "handOverDate", "handoverDate", "hasEKhata",
+    "id", "isBdaApproved", "isBiapaApproved", "isCornerUnit", "isExclusive",
+    "kamId", "kamName", "kamStatus", "landKhata", "lastModified", "legalInfo",
+    "listingType", "location", "mapLocation", "media", "micromarket",
+    "noOfBalconies", "noOfBathrooms", "noOfBedrooms", "noOfSeats", "objectId",
+    "ocReceived", "oddSized", "parking", "plotArea", "plotBreadth", "plotLength",
+    "plotNo", "possession", "pricePerSqft", "pricing", "propertyCategory",
+    "propertyId", "propertyName", "propertyType", "readyToMove",
+    "referredFloorNumber", "rentalInfo", "sbua", "societyType", "source",
+    "stage", "status", "structure", "suitableFor", "tenantPreferences",
+    "totalAskPrice", "totalFloors", "totalRooms", "typeOfWaterSupply", "uds",
+    "unitNumber", "waterSupply", "zone",
+]
+
+
+# ---------------------------
 # Fetch data from Firestore (batched pagination, same as inventories-from-firebase.py)
 # ---------------------------
 def fetch_and_process(collection_name):
@@ -521,7 +552,7 @@ def fetch_and_process(collection_name):
     row_builder = build_row_new if _db_args.db == 'new' else build_row
 
     def fetch_page(last_doc):
-        q = collection_ref.order_by("__name__").limit(PAGE_SIZE)
+        q = collection_ref.select(SELECT_FIELDS).order_by("__name__").limit(PAGE_SIZE)
         if last_doc is not None:
             q = q.start_after(last_doc)
         return list(q.stream())
@@ -569,23 +600,34 @@ def fetch_and_process(collection_name):
 # ---------------------------
 # Write data to Google Sheets (Sheets API v4: clear + update, same as inventories-from-firebase.py)
 # ---------------------------
+def _build_sheets_service():
+    """One service per thread — googleapiclient http objects are not thread-safe."""
+    sheets_creds_dict = {
+        "type": "service_account",
+        "project_id": GSPREAD_PROJECT_ID,
+        "private_key": GSPREAD_PRIVATE_KEY,
+        "client_email": GSPREAD_CLIENT_EMAIL,
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+    creds = Credentials.from_service_account_info(
+        sheets_creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
+    return build("sheets", "v4", http=authed_http, cache_discovery=False)
+
+
 def write_to_google_sheet(data):
     if not data:
         logger.info("No data to write.")
         return
     try:
-        sheets_creds_dict = {
-            "type": "service_account",
-            "project_id": GSPREAD_PROJECT_ID,
-            "private_key": GSPREAD_PRIVATE_KEY,
-            "client_email": GSPREAD_CLIENT_EMAIL,
-            "token_uri": "https://oauth2.googleapis.com/token",
-        }
-        creds = Credentials.from_service_account_info(
-            sheets_creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-        authed_http = AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
-        service = build("sheets", "v4", http=authed_http, cache_discovery=False)
+        service = _build_sheets_service()
+        thread_local = threading.local()
+
+        def service_for_thread():
+            if not hasattr(thread_local, "service"):
+                thread_local.service = _build_sheets_service()
+            return thread_local.service
 
         num_cols = len(UNIFIED_HEADERS)
         end_col = column_index_to_letter(num_cols)
@@ -602,25 +644,36 @@ def write_to_google_sheet(data):
             body={}
         ).execute(num_retries=3)
 
-        logger.info(f"📝 Writing {total} rows via batchUpdate...")
-        batch_data = []
+        batches = []
         for i in range(0, total, WRITE_BATCH_SIZE):
             chunk = all_rows[i:i + WRITE_BATCH_SIZE]
             start_row = i + 1
-            batch_data.append({
+            batches.append({
                 "range": f"{quoted}!A{start_row}:{end_col}{start_row + len(chunk) - 1}",
                 "values": chunk,
                 "majorDimension": "ROWS"
             })
 
-        service.spreadsheets().values().batchUpdate(
-            spreadsheetId=GOOGLE_SHEET_ID,
-            body={"valueInputOption": "USER_ENTERED", "data": batch_data, "includeValuesInResponse": False}
-        ).execute(num_retries=3)
+        logger.info(f"📝 Writing {total} rows in {len(batches)} parallel batches...")
 
-        logger.info(f"✅ Written {total} rows in {time.time()-t0:.2f}s")
+        def write_batch(batch):
+            service_for_thread().spreadsheets().values().batchUpdate(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": [batch],
+                      "includeValuesInResponse": False}
+            ).execute(num_retries=3)
+            return len(batch["values"])
+
+        written = 0
+        with ThreadPoolExecutor(max_workers=min(WRITE_WORKERS, len(batches))) as ex:
+            futures = [ex.submit(write_batch, b) for b in batches]
+            for f in as_completed(futures):
+                written += f.result()
+
+        logger.info(f"✅ Written {written} rows in {time.time()-t0:.2f}s")
     except Exception as e:
         logger.error(f"Error writing to Google Sheets: {e}", exc_info=True)
+
 
 def main():
     start = time.time()
